@@ -35,6 +35,7 @@ const localIsoPath = ref<string>("");
 const errorMessage = ref<string>("");
 const showExitModal = ref(false);
 const isLangDropdownOpen = ref(false);
+const isLinux = ref(false);
 
 const usbDrives = ref<UsbDrive[]>([]);
 const selectedDriveNum = ref<number | null>(null);
@@ -614,6 +615,29 @@ const translations = {
 
 const t = computed(() => translations[lang.value]);
 
+const dashboardSubtitle = computed(() => {
+  if (isLinux.value) {
+    if (lang.value === "ua") {
+      return "Ви запустили інсталятор на ОС Linux. Запишіть образ на флешку для встановлення.";
+    } else if (lang.value === "de") {
+      return "Sie haben den Installer unter Linux gestartet. Schreiben Sie das Image auf einen USB-Stick.";
+    } else if (lang.value === "es") {
+      return "Ha iniciado el instalador en Linux. Grabe la imagen en una unidad USB para la instalación.";
+    } else if (lang.value === "ar") {
+      return "لقد قمت بتشغيل برنامج التثبيت على نظام لينكس. يرجى كتابة الصورة على فلاشة USB للتثبيت.";
+    } else if (lang.value === "zh") {
+      return "您已在 Linux 系统中启动安装程序。请将镜像写入 U 盘以进行安装。";
+    } else if (lang.value === "ja") {
+      return "Linuxでインストーラーを起動しました。インストールするにはイメージをUSBに書き込んでください。";
+    } else if (lang.value === "hi") {
+      return "आपने लिनक्स पर इंस्टॉलर शुरू किया है। कृपया स्थापना के लिए छवि को यूएसबी पर लिखें।";
+    } else {
+      return "You are running the installer on Linux. Write the image to a USB flash drive to install.";
+    }
+  }
+  return t.value.dashboard_subtitle;
+});
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 Bytes";
   const k = 1024;
@@ -800,6 +824,7 @@ function closeLangDropdown() {
 }
 
 onMounted(async () => {
+  isLinux.value = navigator.userAgent.toLowerCase().includes("linux");
   const systemLang = (navigator.language || "en").toLowerCase();
   if (systemLang.startsWith("uk")) {
     lang.value = "ua";
@@ -892,6 +917,12 @@ const downloadEta = computed(() => {
     </header>
 
     <main class="main-content">
+      <div v-if="currentScreen === 'dashboard'" style="text-align: center; margin-bottom: 32px;">
+        <p style="font-size: 15px; color: var(--text-secondary); max-width: 600px; margin: 0 auto; line-height: 1.6;">
+          {{ dashboardSubtitle }}
+        </p>
+      </div>
+
       <div v-if="currentScreen === 'dashboard'" class="cards-grid">
         <div class="action-card" @click="selectDashboardOption('flash')">
           <div class="card-icon-container">
@@ -901,7 +932,7 @@ const downloadEta = computed(() => {
           <p class="card-description">{{ t.card_flash_desc }}</p>
         </div>
 
-        <div class="action-card secondary" @click="selectDashboardOption('hdd')">
+        <div v-if="!isLinux" class="action-card secondary" @click="selectDashboardOption('hdd')">
           <div class="card-icon-container">
             <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="18" rx="2" ry="2"/><path d="M12 12h.01"/><path d="M12 16h.01"/><path d="M16 12h.01"/><path d="M16 16h.01"/><path d="M6 8h12"/></svg>
           </div>

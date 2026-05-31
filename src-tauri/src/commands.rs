@@ -1,19 +1,34 @@
 use futures_util::StreamExt;
 use std::io::{Read, Write};
-use std::os::windows::io::FromRawHandle;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::io::FromRawHandle;
+
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, GENERIC_READ, GENERIC_WRITE,
 };
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
 };
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Ioctl::{
     FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME, FSCTL_UNLOCK_VOLUME,
 };
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::IO::DeviceIoControl;
+
+#[cfg(target_os = "windows")]
+struct SendHandle(HANDLE);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for SendHandle {}
+
+#[cfg(target_os = "windows")]
+unsafe impl Sync for SendHandle {}
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "PascalCase")]
@@ -23,6 +38,7 @@ pub struct UsbDrive {
     pub size: u64,
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn lock_volume(handle: HANDLE) -> bool {
     let mut returned: u32 = 0;
     DeviceIoControl(
@@ -37,6 +53,7 @@ unsafe fn lock_volume(handle: HANDLE) -> bool {
     ) != 0
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn dismount_volume(handle: HANDLE) -> bool {
     let mut returned: u32 = 0;
     DeviceIoControl(
@@ -51,6 +68,7 @@ unsafe fn dismount_volume(handle: HANDLE) -> bool {
     ) != 0
 }
 
+#[cfg(target_os = "windows")]
 unsafe fn unlock_volume(handle: HANDLE) -> bool {
     let mut returned: u32 = 0;
     DeviceIoControl(
@@ -81,22 +99,85 @@ fn parse_usb_drives(json_str: &str) -> Vec<UsbDrive> {
 
 #[tauri::command]
 pub async fn get_usb_drives() -> Result<Vec<UsbDrive>, String> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-Disk | Where-Object BusType -eq 'USB' | Select-Object Number, FriendlyName, Size | ConvertTo-Json -Compress",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Disk | Where-Object BusType -eq 'USB' | Select-Object Number, FriendlyName, Size | ConvertTo-Json -Compress",
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
 
-    if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("PowerShell error listing drives: {}", err_msg));
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("PowerShell error listing drives: {}", err_msg));
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_usb_drives(&json_str))
     }
 
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_usb_drives(&json_str))
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("lsblk")
+            .args(["-J", "-b", "-o", "NAME,MODEL,SIZE,TRAN"])
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if !output.status.success() {
+            let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("lsblk error: {}", err_msg));
+        }
+
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        
+        #[derive(Deserialize)]
+        struct LsblkDevice {
+            name: String,
+            model: Option<String>,
+            size: Option<u64>,
+            tran: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct LsblkOutput {
+            blockdevices: Option<Vec<LsblkDevice>>,
+        }
+
+        let parsed: LsblkOutput = serde_json::from_str(&stdout_str)
+            .map_err(|e| format!("Failed to parse lsblk output: {}", e))?;
+
+        let mut list = Vec::new();
+        if let Some(devices) = parsed.blockdevices {
+            for dev in devices {
+                if dev.tran.as_deref() == Some("usb") {
+                    let friendly_name = dev.model.unwrap_or_else(|| dev.name.clone());
+                    let mut num: u32 = 0;
+                    if dev.name.starts_with("sd") && dev.name.len() >= 3 {
+                        let c = dev.name.as_bytes()[2];
+                        if c >= b'a' && c <= b'z' {
+                            num = (c - b'a' + 1) as u32;
+                        }
+                    }
+                    if num > 0 {
+                        list.push(UsbDrive {
+                            number: num,
+                            friendly_name,
+                            size: dev.size.unwrap_or(0),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(list)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Ok(vec![])
+    }
 }
 
 #[tauri::command]
@@ -181,6 +262,75 @@ pub async fn download_iso(
     Ok(())
 }
 
+async fn write_iso_blocks(
+    window: tauri::Window,
+    iso_file: std::fs::File,
+    drive_file: &mut std::fs::File,
+    total_size: u64,
+) -> Result<(), String> {
+    let mut reader = std::io::BufReader::new(iso_file);
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut written: u64 = 0;
+    
+    let start_time = std::time::Instant::now();
+    let mut last_emit = std::time::Instant::now();
+
+    #[derive(Clone, Serialize)]
+    struct Progress {
+        written: u64,
+        total: u64,
+        speed: f64,
+    }
+
+    loop {
+        let n = reader.read(&mut buffer).map_err(|e| format!("Read error: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        drive_file.write_all(&buffer[..n]).map_err(|e| format!("Write error: {}", e))?;
+        written += n as u64;
+
+        let now = std::time::Instant::now();
+        if now.duration_since(last_emit).as_millis() > 200 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                written as f64 / elapsed
+            } else {
+                0.0
+            };
+
+            let _ = window.emit(
+                "flash-progress",
+                Progress {
+                    written,
+                    total: total_size,
+                    speed,
+                },
+            );
+            last_emit = now;
+        }
+    }
+
+    drive_file.flush().map_err(|e| e.to_string())?;
+    
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let speed = if elapsed > 0.0 {
+        written as f64 / elapsed
+    } else {
+        0.0
+    };
+    let _ = window.emit(
+        "flash-progress",
+        Progress {
+            written,
+            total: total_size,
+            speed,
+        },
+    );
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn flash_usb_drive(
     window: tauri::Window,
@@ -196,82 +346,60 @@ pub async fn flash_usb_drive(
     let iso_file = std::fs::File::open(&iso_path).map_err(|e| format!("Failed to open ISO file: {}", e))?;
     let total_size = iso_file.metadata().map_err(|e| e.to_string())?.len();
 
-    let drive_path = format!("\\\\.\\PhysicalDrive{}", drive_num);
-    let mut drive_path_w: Vec<u16> = drive_path.encode_utf16().collect();
-    drive_path_w.push(0);
+    #[cfg(target_os = "windows")]
+    {
+        let drive_path = format!("\\\\.\\PhysicalDrive{}", drive_num);
+        let mut drive_path_w: Vec<u16> = drive_path.encode_utf16().collect();
+        drive_path_w.push(0);
 
-    unsafe {
-        let handle = CreateFileW(
-            drive_path_w.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        );
+        let (mut drive_file, raw_handle) = unsafe {
+            let handle = CreateFileW(
+                drive_path_w.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            );
 
-        if handle == INVALID_HANDLE_VALUE {
-            return Err("Failed to open physical drive. Please ensure you are running as Administrator.".into());
-        }
-
-        if !lock_volume(handle) {
-            CloseHandle(handle);
-            return Err("Failed to lock volume. Please close any open files or folders on the USB drive.".into());
-        }
-
-        if !dismount_volume(handle) {
-            unlock_volume(handle);
-            CloseHandle(handle);
-            return Err("Failed to dismount volume.".into());
-        }
-
-        let mut drive_file = std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void);
-        let mut reader = std::io::BufReader::new(iso_file);
-        let mut buffer = vec![0u8; 1024 * 1024];
-        let mut written: u64 = 0;
-        
-        let start_time = std::time::Instant::now();
-        let mut last_emit = std::time::Instant::now();
-
-        #[derive(Clone, Serialize)]
-        struct Progress {
-            written: u64,
-            total: u64,
-            speed: f64,
-        }
-
-        loop {
-            let n = reader.read(&mut buffer).map_err(|e| format!("Read error: {}", e))?;
-            if n == 0 {
-                break;
+            if handle == INVALID_HANDLE_VALUE {
+                return Err("Failed to open physical drive. Please ensure you are running as Administrator.".into());
             }
-            drive_file.write_all(&buffer[..n]).map_err(|e| format!("Write error: {}", e))?;
-            written += n as u64;
 
-            let now = std::time::Instant::now();
-            if now.duration_since(last_emit).as_millis() > 200 {
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    written as f64 / elapsed
-                } else {
-                    0.0
-                };
-
-                let _ = window.emit(
-                    "flash-progress",
-                    Progress {
-                        written,
-                        total: total_size,
-                        speed,
-                    },
-                );
-                last_emit = now;
+            if !lock_volume(handle) {
+                CloseHandle(handle);
+                return Err("Failed to lock volume. Please close any open files or folders on the USB drive.".into());
             }
-        }
 
-        drive_file.flush().map_err(|e| e.to_string())?;
-        unlock_volume(handle);
+            if !dismount_volume(handle) {
+                unlock_volume(handle);
+                CloseHandle(handle);
+                return Err("Failed to dismount volume.".into());
+            }
+
+            (std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void), SendHandle(handle))
+        };
+
+        write_iso_blocks(window, iso_file, &mut drive_file, total_size).await?;
+
+        unsafe {
+            unlock_volume(raw_handle.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let drive_letter = (b'a' + (drive_num - 1) as u8) as char;
+        let drive_path = format!("/dev/sd{}", drive_letter);
+
+        let mut drive_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&drive_path)
+            .map_err(|e| format!("Failed to open device {}: {}. Ensure you have root/sudo privileges.", drive_path, e))?;
+
+        write_iso_blocks(window, iso_file, &mut drive_file, total_size).await?;
     }
 
     Ok(())
@@ -279,111 +407,113 @@ pub async fn flash_usb_drive(
 
 #[tauri::command]
 pub async fn setup_direct_boot(iso_path: String) -> Result<(), String> {
-    let mount_output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "mountvol S: /S"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    
-    if !mount_output.status.success() {
-        return Err("Failed to mount EFI partition. Ensure the app has Administrator privileges.".into());
-    }
-
-    struct MountGuard;
-    impl Drop for MountGuard {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", "mountvol S: /D"])
-                .output();
+    #[cfg(target_os = "windows")]
+    {
+        let mount_output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "mountvol S: /S"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        
+        if !mount_output.status.success() {
+            return Err("Failed to mount EFI partition. Ensure the app has Administrator privileges.".into());
         }
-    }
-    let _guard = MountGuard;
 
-    let iso_path_abs = std::path::Path::new(&iso_path)
-        .canonicalize()
-        .map_err(|e| format!("Invalid ISO file path: {}", e))?
-        .to_string_lossy()
-        .to_string()
-        .replace("\\\\?\\", "");
+        struct MountGuard;
+        impl Drop for MountGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", "mountvol S: /D"])
+                    .output();
+            }
+        }
+        let _guard = MountGuard;
 
-    let mount_iso_cmd = format!(
-        "$mount = Mount-DiskImage -ImagePath '{}' -PassThru; ($mount | Get-Volume).DriveLetter",
-        iso_path_abs
-    );
-    let iso_mount_output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &mount_iso_cmd])
-        .output()
-        .map_err(|e| e.to_string())?;
+        let iso_path_abs = std::path::Path::new(&iso_path)
+            .canonicalize()
+            .map_err(|e| format!("Invalid ISO file path: {}", e))?
+            .to_string_lossy()
+            .to_string()
+            .replace("\\\\?\\", "");
 
-    if !iso_mount_output.status.success() {
-        return Err("Failed to mount ISO to retrieve kernel/initramfs paths.".into());
-    }
+        let mount_iso_cmd = format!(
+            "$mount = Mount-DiskImage -ImagePath '{}' -PassThru; ($mount | Get-Volume).DriveLetter",
+            iso_path_abs
+        );
+        let iso_mount_output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &mount_iso_cmd])
+            .output()
+            .map_err(|e| e.to_string())?;
 
-    let drive_letter = String::from_utf8_lossy(&iso_mount_output.stdout).trim().to_string();
-    if drive_letter.is_empty() {
-        return Err("Failed to assign a drive letter to mounted ISO.".into());
-    }
+        if !iso_mount_output.status.success() {
+            return Err("Failed to mount ISO to retrieve kernel/initramfs paths.".into());
+        }
 
-    let iso_drive = format!("{}:\\", drive_letter);
+        let drive_letter = String::from_utf8_lossy(&iso_mount_output.stdout).trim().to_string();
+        if drive_letter.is_empty() {
+            return Err("Failed to assign a drive letter to mounted ISO.".into());
+        }
 
-    let mut kernel_src = format!("{}arch\\boot\\x86_64\\vmlinuz-linux", iso_drive);
-    let mut initramfs_src = format!("{}arch\\boot\\x86_64\\initramfs-linux.img", iso_drive);
+        let iso_drive = format!("{}:\\", drive_letter);
 
-    if !std::path::Path::new(&kernel_src).exists() {
-        kernel_src = format!("{}boot\\vmlinuz-x86_64", iso_drive);
-        initramfs_src = format!("{}boot\\initramfs-x86_64.img", iso_drive);
+        let mut kernel_src = format!("{}arch\\boot\\x86_64\\vmlinuz-linux", iso_drive);
+        let mut initramfs_src = format!("{}arch\\boot\\x86_64\\initramfs-linux.img", iso_drive);
+
         if !std::path::Path::new(&kernel_src).exists() {
-            let _ = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &format!("Dismount-DiskImage -ImagePath '{}'", iso_path_abs)])
-                .output();
-            return Err("Failed to find kernel and initramfs files inside the ISO. The ISO might be corrupted or unsupported.".into());
+            kernel_src = format!("{}boot\\vmlinuz-x86_64", iso_drive);
+            initramfs_src = format!("{}boot\\initramfs-x86_64.img", iso_drive);
+            if !std::path::Path::new(&kernel_src).exists() {
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", &format!("Dismount-DiskImage -ImagePath '{}'", iso_path_abs)])
+                    .output();
+                return Err("Failed to find kernel and initramfs files inside the ISO. The ISO might be corrupted or unsupported.".into());
+            }
         }
-    }
 
-    std::fs::create_dir_all("C:\\PrismLinux").map_err(|e| e.to_string())?;
-    std::fs::copy(&kernel_src, "C:\\PrismLinux\\vmlinuz").map_err(|e| e.to_string())?;
-    std::fs::copy(&initramfs_src, "C:\\PrismLinux\\initramfs.img").map_err(|e| e.to_string())?;
-    std::fs::copy(&iso_path_abs, "C:\\PrismLinux\\prism.iso").map_err(|e| e.to_string())?;
+        std::fs::create_dir_all("C:\\PrismLinux").map_err(|e| e.to_string())?;
+        std::fs::copy(&kernel_src, "C:\\PrismLinux\\vmlinuz").map_err(|e| e.to_string())?;
+        std::fs::copy(&initramfs_src, "C:\\PrismLinux\\initramfs.img").map_err(|e| e.to_string())?;
+        std::fs::copy(&iso_path_abs, "C:\\PrismLinux\\prism.iso").map_err(|e| e.to_string())?;
 
-    let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &format!("Dismount-DiskImage -ImagePath '{}'", iso_path_abs)])
-        .output();
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("Dismount-DiskImage -ImagePath '{}'", iso_path_abs)])
+            .output();
 
-    std::fs::create_dir_all("S:\\EFI\\PrismLinux").map_err(|e| e.to_string())?;
+        std::fs::create_dir_all("S:\\EFI\\PrismLinux").map_err(|e| e.to_string())?;
 
-    let grub_url = "http://archive.ubuntu.com/ubuntu/dists/jammy/main/uefi/grub2-amd64/current/grubnetx64.efi.signed";
-    let client = reqwest::Client::new();
-    let grub_bytes = client.get(grub_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Ubuntu bootloader server: {}", e))?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
+        let grub_url = "http://archive.ubuntu.com/ubuntu/dists/jammy/main/uefi/grub2-amd64/current/grubnetx64.efi.signed";
+        let client = reqwest::Client::new();
+        let grub_bytes = client.get(grub_url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to connect to Ubuntu bootloader server: {}", e))?
+            .bytes()
+            .await
+            .map_err(|e| e.to_string())?;
 
-    std::fs::write("S:\\EFI\\PrismLinux\\grubx64.efi", &grub_bytes).map_err(|e| e.to_string())?;
+        std::fs::write("S:\\EFI\\PrismLinux\\grubx64.efi", &grub_bytes).map_err(|e| e.to_string())?;
 
-    let uuid_output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "(Get-Volume -DriveLetter C).Id"])
-        .output()
-        .map_err(|e| e.to_string())?;
+        let uuid_output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "(Get-Volume -DriveLetter C).Id"])
+            .output()
+            .map_err(|e| e.to_string())?;
 
-    let vol_id = String::from_utf8_lossy(&uuid_output.stdout).trim().to_string();
-    let uuid = if let Some(start) = vol_id.find('{') {
-        if let Some(end) = vol_id.find('}') {
-            &vol_id[start + 1..end]
+        let vol_id = String::from_utf8_lossy(&uuid_output.stdout).trim().to_string();
+        let uuid = if let Some(start) = vol_id.find('{') {
+            if let Some(end) = vol_id.find('}') {
+                &vol_id[start + 1..end]
+            } else {
+                ""
+            }
         } else {
             ""
+        };
+
+        if uuid.is_empty() {
+            return Err("Failed to read NTFS volume ID for C: drive.".into());
         }
-    } else {
-        ""
-    };
 
-    if uuid.is_empty() {
-        return Err("Failed to read NTFS volume ID for C: drive.".into());
-    }
-
-    let grub_cfg = format!(
-        r#"set default=0
+        let grub_cfg = format!(
+            r#"set default=0
 set timeout=5
 
 menuentry "Prism Linux Live Installer" --class arch {{
@@ -393,82 +523,144 @@ menuentry "Prism Linux Live Installer" --class arch {{
     initrd /PrismLinux/initramfs.img
 }}
 "#
-    );
+        );
 
-    std::fs::write("S:\\EFI\\PrismLinux\\grub.cfg", grub_cfg).map_err(|e| e.to_string())?;
+        std::fs::write("S:\\EFI\\PrismLinux\\grub.cfg", grub_cfg).map_err(|e| e.to_string())?;
 
-    let bcd_create = std::process::Command::new("cmd")
-        .args(["/C", "bcdedit /create /d \"Prism Linux Installer\" /application OSLOADER"])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !bcd_create.status.success() {
-        return Err("Failed to create BCD boot entry.".into());
-    }
-
-    let bcd_str = String::from_utf8_lossy(&bcd_create.stdout).to_string();
-    let bcd_guid = if let Some(start) = bcd_str.find('{') {
-        if let Some(end) = bcd_str.find('}') {
-            Some(&bcd_str[start..=end])
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let guid = bcd_guid.ok_or_else(|| "Failed to parse boot GUID from BCDEDIT.".to_string())?;
-
-    let bcd_commands = [
-        format!("bcdedit /set {} device partition=S:", guid),
-        format!("bcdedit /set {} path \\EFI\\PrismLinux\\grubx64.efi", guid),
-        format!("bcdedit /set {} locale en-US", guid),
-        format!("bcdedit /displayorder {} /addlast", guid),
-    ];
-
-    for cmd in bcd_commands {
-        let out = std::process::Command::new("cmd")
-            .args(["/C", &cmd])
+        let bcd_create = std::process::Command::new("cmd")
+            .args(["/C", "bcdedit /create /d \"Prism Linux Installer\" /application OSLOADER"])
             .output()
             .map_err(|e| e.to_string())?;
-        
-        if !out.status.success() {
-            let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
-            return Err(format!("BCDEDIT setup failed on command '{}': {}", cmd, err_msg));
+
+        if !bcd_create.status.success() {
+            return Err("Failed to create BCD boot entry.".into());
         }
+
+        let bcd_str = String::from_utf8_lossy(&bcd_create.stdout).to_string();
+        let bcd_guid = if let Some(start) = bcd_str.find('{') {
+            if let Some(end) = bcd_str.find('}') {
+                Some(&bcd_str[start..=end])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let guid = bcd_guid.ok_or_else(|| "Failed to parse boot GUID from BCDEDIT.".to_string())?;
+
+        let bcd_commands = [
+            format!("bcdedit /set {} device partition=S:", guid),
+            format!("bcdedit /set {} path \\EFI\\PrismLinux\\grubx64.efi", guid),
+            format!("bcdedit /set {} locale en-US", guid),
+            format!("bcdedit /displayorder {} /addlast", guid),
+        ];
+
+        for cmd in bcd_commands {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", &cmd])
+                .output()
+                .map_err(|e| e.to_string())?;
+            
+            if !out.status.success() {
+                let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+                return Err(format!("BCDEDIT setup failed on command '{}': {}", cmd, err_msg));
+            }
+        }
+        Ok(())
     }
 
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = iso_path;
+        Err("Direct boot setup is only supported on Windows. On Linux, please use a USB Flash Drive to install the system.".into())
+    }
 }
 
 #[tauri::command]
 pub async fn select_local_iso() -> Result<String, String> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'ISO files (*.iso)|*.iso'; $f.ShowDialog() | Out-Null; $f.FileName",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'ISO files (*.iso)|*.iso'; $f.ShowDialog() | Out-Null; $f.FileName",
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
 
-    if !output.status.success() {
-        return Err("File selection cancelled or failed.".into());
+        if !output.status.success() {
+            return Err("File selection cancelled or failed.".into());
+        }
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Err("No file selected.".into());
+        }
+        Ok(path)
     }
 
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return Err("No file selected.".into());
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("zenity")
+            .args(["--file-selection", "--file-filter=*.iso"])
+            .output();
+
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return Ok(path);
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+
+        let kdialog_output = std::process::Command::new("kdialog")
+            .args(["--getopenfilename", ".", "*.iso"])
+            .output();
+
+        match kdialog_output {
+            Ok(out) => {
+                if out.status.success() {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return Ok(path);
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+
+        Err("No graphical file dialog (zenity or kdialog) was found on your Linux system. Please copy your ISO path manually.".into())
     }
-    Ok(path)
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Err("Unsupported operating system.".into())
+    }
 }
 
 #[tauri::command]
 pub async fn reboot_system() -> Result<(), String> {
-    std::process::Command::new("shutdown")
-        .args(["/r", "/t", "0"])
-        .output()
-        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("shutdown")
+            .args(["/r", "/t", "0"])
+            .output()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("reboot")
+            .output()
+            .map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 
@@ -476,4 +668,3 @@ pub async fn reboot_system() -> Result<(), String> {
 pub fn exit_app() {
     std::process::exit(0);
 }
-
