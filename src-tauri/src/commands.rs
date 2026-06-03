@@ -83,6 +83,7 @@ unsafe fn unlock_volume(handle: HANDLE) -> bool {
     ) != 0
 }
 
+#[cfg(target_os = "windows")]
 fn parse_usb_drives(json_str: &str) -> Vec<UsbDrive> {
     let s = json_str.trim();
     if s.is_empty() {
