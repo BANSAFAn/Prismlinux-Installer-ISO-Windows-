@@ -1,6 +1,6 @@
-# Prism Linux Installer
+# PrismLinux Installer
 
-Official desktop installer and flasher for the Prism Linux operating system. The application enables users to easily write official ISO images to USB flash drives or configure live installer boot staging directly from a local hard drive on Windows.
+Official desktop installer and flasher for the PrismLinux operating system. The application enables users to easily write official ISO images to USB flash drives or configure live installer boot staging directly from a local hard drive on Windows.
 
 ## Technology Stack
 
