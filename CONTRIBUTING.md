@@ -1,4 +1,4 @@
-# Contributing to Prism Linux Installer
+# Contributing to PrismLinux Installer
 
 Thank you for your interest in contributing to the Prism Linux Installer project! Follow these guidelines to ensure a smooth, efficient, and consistent development workflow.
 
